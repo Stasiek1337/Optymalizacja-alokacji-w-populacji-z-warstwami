@@ -1,0 +1,893 @@
+---
+title: "GUSła"
+author: "Aleksandra Kulczycka & Stanisław Frelik"
+date: "2024-06-04"
+output:
+  html_document:
+    code_folding: show
+---
+
+# Wstęp
+
+Teoria próbkowania stanowi jeden z istotnych fundamentów rzetelnego i skutecznego praktykowania statystyki. W szczególności, optymalna alokacja próbki w modelu 'z warstwami' stanowi podstawowy, a zarazem zaskakująco skomplikowany problem metodologii próbkowania. W tej pracy rozważymy problem minimalizacji wariancji $\pi$-estymatora za pomocą algorytmu symulowanego wyżarzania. Rozważymy dwa modele próbkowania w problemie z warstawmi - jednopoziomowe próbkowanie warstwowe oraz próbkowanie dwupoziomowe gdy 'nadpopulacja' również posiada warstwy.
+
+# Opis metodologii
+
+Interesujący nas problem postanowiliśmy zaprezentować na przykładzie.
+
+Rozważmy pewną populację szkół przyporządkowanych do województw. Oczywiście zakładamy, że województwa, w sensie zbiorów szkół, są rozłączne, niepuste i stanowią pokrycie populacji szkół. W tym modelu o województwach będziemy mówili właśnie jako o warstwach, natomiast alokacją nazwiemy dowolny, możliwy wybór szkół. Przez możliwy mamy na myśli to, że liczba szkół w województwie, przy danej populacji, jest ustalona a co za tym idzie, otrzymujemy naturalne ograniczenia na wielkość alokacji w danej warstwie. Ponadto zakładamy, że mamy dane współczynniki wariancji dla każdej z warstw. 
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Wczytanie potrzebnych pakietów
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+# Pobranie danych geograficznych dla Polski
+wojewodztwa_sf <- ne_states(country = "Poland", returnclass = "sf")
+
+# Tworzenie przykładowych danych dla szkół
+set.seed(333)
+szkoly <- data.frame(
+  Wojewodztwo = sample(wojewodztwa_sf$name, 500, replace = TRUE),
+  Szkoła = 1:500,
+  Wariancja = runif(500, 0.03, 0.06),
+  Wybrane = sample(c("Tak", "Nie"), 500, replace = TRUE, prob = c(0.3, 0.7))
+)
+
+# Zapewnienie, że w każdym województwie jest co najmniej jedna szkoła wybrana do próby
+wojewodztwa_unikalne <- unique(szkoly$Wojewodztwo)
+for (woj in wojewodztwa_unikalne) {
+  if (sum(szkoly$Wybrane[szkoly$Wojewodztwo == woj] == "Tak") == 0) {
+    idx <- which(szkoly$Wojewodztwo == woj)[1]
+    szkoly$Wybrane[idx] <- "Tak"
+  }
+}
+
+# Dołączenie współrzędnych centroidów województw do danych szkół
+wojewodztwa_centroids <- st_centroid(wojewodztwa_sf)
+wojewodztwa_sf <- cbind(wojewodztwa_sf, st_coordinates(wojewodztwa_centroids))
+
+# Scalanie danych szkół z centroids
+szkoly <- merge(szkoly, wojewodztwa_sf, by.x = "Wojewodztwo", by.y = "name")
+
+# Obliczanie liczby wybranych szkół dla każdego województwa
+szkoly_summary <- szkoly %>%
+  group_by(Wojewodztwo) %>%
+  summarise(
+    Wybrane_Count = sum(Wybrane == "Tak")
+  )
+
+# Dołączenie liczby wybranych szkół do danych geograficznych województw
+wojewodztwa_sf <- merge(wojewodztwa_sf, szkoly_summary, by.x = "name", by.y = "Wojewodztwo")
+
+ggplot() +
+  geom_sf(data = wojewodztwa_sf, aes(fill = Wybrane_Count), color = "black") +
+  geom_text(data = wojewodztwa_sf, aes(label = paste("Wybrane:", Wybrane_Count, "\nWszystkie:", Wybrane_Count + nrow(szkoly_summary)), x = X, y = Y), size = 2.5, color = "black") +
+  labs(title = "Przykład rozważanego problemu") +
+  scale_fill_gradient(low = "white", high = "#BAABDA", na.value = NA) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+```
+
+Opisany model stanowi przykład jednopoziomowego próbkowania warstwowego. Dalej rozważymy (dobrze znany z literatury) $\pi$-estymator całkowitej (lub średniej) wartości interesującej nas cechy charakteryzującej tę populację. Przy rozważanej metodologii ów estymator jest nieobciążony. Chcielibyśmy zatem minimalizować jego wariancję w celu uzyskania optymalnej alokacji. Nietrudno zauważyć, że już przy stosunkowo małej (jak na potrzeby rzeczywistych zastosowań) populacji szkół problem ten staje się zbyt skomplikowany obliczeniowo dla standardowych metod optymalizacji. W kolejnych rozdziałach pokażemy jak wykorzystać algorytm symulowanego wyżarzania do rozwiązania tego problemu.
+
+
+
+Zgoła bardziej skomplikowana sytuacja występuje, gdy rozważymy model próbkowania dwustopniowego z warstwami. Wróćmy do przykładu z województwami i szkołami. Załóżmy ponadto, że w każdej szkole mamy pewną (ustaloną) liczbę uczniów, których cecha jest przedmiotem naszego badania (którą chcemy estymować w optymalny sposób). Wówczas alokacja będzie polegała na wyborze (na potrzeby tej pracy ustalonej) całkowitej liczby szkół z poszczególnych województw (pamiętając o naturalnych ograniczeniach górnych i dolnych) oraz wyborze pewnej liczby uczniów z każdej szkoły. Oczywiście na liczbę uczniów również występują naturalne ograniczenia - nie chcielibyśmy do próbki włączyć więcej uczniów niż faktycznie uczęszcza do konkretnej szkoły. Ponadto cała (dwustopniowa) populacja jest określona przez znane współczynniki wariancji (dla warstw i poszczególnych szkół). Pozostaje jeszcze określenie wielkości drugiego poziomu alokacji, czyli liczby uczniów. W tym celu konstruujemy estymator liczby uczniów, która powinna odpowiadać pierwszemu poziomowi alokacji (w szczególności liczba wybranych uczniów zależy od wyboru liczby szkół w województwach). Oczywiście, znalezienie optymalnej alokacji (minimalizacja wariancji $\pi$-estymatora) dla próbkowania dwustopniowego stanowi znaczące wyzwanie, zarówno teoretyczne jak i praktyczne. Ponownie wykorzystamy, odpowiednio zmodyfkiowany, algorytm symulowanego wyżarzania.
+
+Precyzyjne sformułowanie powyższych problemów optymalizacji oraz zastosowanie algorytmu symulowanego wyżarzania przedstawimy w kolejnych rozdziałach.
+
+# Inspiracje, literatura
+
+Naszą główną motywacją były dwie prace traktujące o problemie optymalnej alokacji w przypadku populacji 'z warstwami':
+
+-   [1] 'Recursive Neyman algorithm for optimum sample allocation under box constraints on sample sizes in strata' (J. Wesołowski, R. Wieczorkowski, W. Wójciak)
+-   [2] 'Fixed precision optimal allocation in two-stage sampling' (W. Niemiro, J. Wesołowski)
+
+Przedstawione w nich matematyczne sformułowania interesujących nas problemów, ich teoretyczne rozwiązania oraz zaimplementowane algorytmy zdecydowanie ułatwiły nam pracę. Warto w tym miejscu zaznaczyć, iż pełne zagadnienie optymalnej alokacji (to znaczy z pełnymi ograniczeniami) w przypadku próbkowania dwustopniowego z warstwami nie zostało do tej pory rozwikłane. Stąd tym bardziej istotna staje się druga część naszej pracy, w której rozważamy właśnie to zagadnienie.
+
+Informacje na temat algorytmu symulowanego wyżarzania czerpaliśmy z książki:
+
+-   [3] 'Finite Markov Chains and Algorithmic Applications' (O. Häggström)
+
+# Próbkowanie jednostopniowe
+
+W tym rozdziale zaprezentujemy jak wykorzystać algorytm symulowanego wyżarzania do znalezienia optymalnej alokacji w przypadku próbkowania jednostopniowego z warstwami - czyli do minimalizacji wariancji $\pi$-estymatora.
+
+## Sformułowanie matematyczne
+
+Interesujący nas problem zapiszemy w języku optymalizacji. Przyjmijmy oznaczenia:
+
+-   $H$ - liczba warstw charakteryzująca rozważaną populację
+-   $A_h$ - znane współczynniki wariancji w każdej z warstw ($h = 1, \ldots, H$)
+-   $x_h$ - liczba elementów z warstwy $h$ wybrana do próbki
+-   $M_h$ - całkowita liczba elementów w $h$-tej warstwie
+-   $m_h$ - dolne ograniczenie na liczbę elementów wybranych do próbki z $h$-tej warstwy
+-   $n$ - ustalona wielkość próbki
+
+Wówczas na podstawie [1] wiemy, że wariancja $\pi$-estymatora wyraża się wzorem:
+
+$\sum_{h=1}^H \frac{A_h^2}{x_h}$
+
+Natomiast problem optymalizacji możemy zapisać jako:
+
+$\min_{\mathbf{x = (x_h)_{h=1}^H}} \sum_{h=1}^H \frac{A_h^2}{x_h}$
+
+$\text{przy ograniczeniach:}\ \sum_{h=1}^H x_h = n\quad \text{oraz}\quad \forall_h\ m_h \leq x_h \leq M_h$
+
+## Rozwiązanie algorytmiczne
+
+Zauważmy od razu, że choć zadanie optymalizacji zdefiniowane w poprzedniej części nie jest całkowitoliczbowe, dla uproszczenia rozważymy jedynie alokacje całkowitoliczbowe. Nasz przykład dobrze ilustruje tę kwestię - trudno byłoby wybrać dwie i pół szkoły z danego województwa.
+
+Powinniśmy zaznaczyć w tym miejscu, że istnieje algorytm, który udowodniono, że zwraca optymalną alokację dla zadania opisanego powyżej. Mówimy tu oczywiście o głównym wyniku pracy [2], czyli algorytmie RNABOX. Posłuży nam on za benchmark w dalszej części. 
+
+Nasza implementacja algorytmu symulowanego wyżarzania jest w tym przypadku w pełni klasyczna. Sąsiedztwo alokacji definiujemy poprzez jednostkową różnicę na dwóch pozycjach w próbce (czyli sąsiadem będzie alokacja, w której z jednego województwa zabraliśmy jedną szkołę, a w innym dodaliśmy (też jedną)). Stąd wykorzystując tak zdefiniowane sąsiedztwo i indukowany przez nie łańcuch Metropolisa oraz rozkład Boltzmanna [3] otrzymujemy teoretyczny zarys algorytmu symulowanego wyżarzania. Jego uproszczony schemat przezntujemy poniżej:
+
+1)  Załóżmy, że mamy pewną alokację $\xi$.
+2)  Losujemy jednostajne ze zbioru $\{1, \ldots, H\}$ dwa indeksy, przy czym chcemy, by były one istotnie różne.
+3)  Na podstawie tych indeksów proponujemy kolejny krok algorytmu, to znaczy (o ile pozwalają na to ograniczenia dolne i górne) z jednej pozycji alokacji zabieramy jeden element, a na drugiej dodajemy. Oznaczmy tę propozycję przez $\tilde{\xi}$
+4)  Obliczamy funkcję celu, czyli wariancję (oznaczenie: $f$) i następnie:
+a)  z prawdopodobieństwem $\min\Big[\exp\left( \frac{f(\xi)-f(\tilde{\xi})}{T}\right), 1\Big]$ akceptujemy zaproponowany krok
+b) z prawdopodobieństwem $1-\min\Big[\exp\left( \frac{f(\xi)-f(\tilde{\xi})}{T}\right), 1\Big]$ zostajemy w bieżącej alokacji
+
+
+```{r, class.source='fold-hide', message=FALSE, warning=FALSE}
+
+library(stratallo)  # biblioteka dot. RNABOX
+library(ggplot2)
+
+inverse_num <- function(x) {
+  return(1/x) 
+}
+
+target <- function(x, A) {
+  return(sum(1/x * A^2))  # Funkcja obliczająca wartość funkcji celu dla danego wektora x i A
+}
+
+gen_prop_box <- function(x) {
+  indices <- sample(seq_along(x), 2, replace = FALSE)  # Losowanie dwóch różnych indeksów z x
+  index_move_1 <- indices[1]  
+  index_move_2 <- indices[2]  
+  
+  if (index_move_1 != index_move_2) {
+    if (x[index_move_1] >= m[index_move_1] & x[index_move_2] > m[index_move_2]) {
+      if (x[index_move_1] < M[index_move_1] & x[index_move_2] <= M[index_move_2]) {
+        x_prop <- x
+        x_prop[index_move_1] <- x_prop[index_move_1] + 1
+        x_prop[index_move_2] <- x_prop[index_move_2] - 1
+      } else {
+        x_prop <- x
+      }
+    } else {
+      x_prop <- x
+    }
+  } else {
+    x_prop <- x
+  }
+  return(x_prop)  # Zwracamy nowy wektor propozycji
+}
+
+sim_anal_box <- function(x, N, S, m, M, n, T_schedule, N_schedule) {
+  A <- N * S  
+  target_values <- numeric(sum(N_schedule))  # Inicjalizacja wektora dla wartości docelowych
+  solutions <- list() 
+  index <- 1  
+  temperature_change_points <- cumsum(N_schedule)  # Punkty zmiany temperatury
+  
+  initial_target <- target(x, A)  
+  
+  for (i in 1:length(N_schedule)) {
+    T_temp <- T_schedule[i]  # Aktualna temperatura
+    for (j in 1:N_schedule[i]) {
+      x_prop <- gen_prop_box(x)  # Wygenerowanie nowej propozycji
+      transit_func <- exp(-(target(x, A) - target(x_prop, A)) / T_temp)  # Funkcja przejścia
+      prob_stay <- min(1, transit_func)  # Prawdopodobieństwo pozostania w obecnym stanie
+      prob_move <- 1 - prob_stay  # Prawdopodobieństwo zmiany stanu
+      coin_flip <- runif(1) 
+      if (coin_flip <= prob_stay) {
+        x <- x  # Pozostaj w obecnym stanie
+      } else {
+        x <- x_prop  # Przejdź do nowej propozycji
+      }
+      target_values[index] <- target(x, A) 
+      solutions[[index]] <- x
+      index <- index + 1
+    }
+  }
+  
+  return(list(solution = x, target_values = target_values, solutions = solutions, temperature_change_points = temperature_change_points))  # Zwraca ostateczne rozwiązanie, wartości docelowe, rozwiązania i punkty zmiany temperatury
+}
+```
+
+## Przykłady
+
+Przykład 1
+
+```{r, class.source='fold-hide', message=FALSE, warning=FALSE}
+N <- c(3000, 4000, 5000, 2000) # Rozmiary warstw
+S <- c(48, 79, 76, 16) # Odchylenia standardowe zmiennej badanej w warstwach
+A <- N * S
+m <- c(100, 90, 500, 50) # Dolne ograniczenia na wielkości próby w warstwach
+M <- c(300, 400, 800, 90) # Górne ograniczenia na wielkości próby w warstwach
+n <- 1284  # Ustalona wielkość próby
+T_schedule <- 10:1/100 # Harmonogram wyżarzania (temperatura)
+N_schedule <- (1:length(T_schedule)) * 25 # Harmonogram wyżarzania (czas)
+x <- c(100, 300, 800, 84) # Zainicjalizowana alokacja
+
+
+sim_data <- sim_anal_box(x, N, S, m, M, n, T_schedule, N_schedule)
+
+target_df <- data.frame(iteration = 1:length(sim_data$target_values), target_value = sim_data$target_values)
+
+solutions_df <- do.call(rbind, lapply(1:length(sim_data$solutions), function(i) {
+  data.frame(iteration = i, strata = 1:length(sim_data$solutions[[i]]), value = sim_data$solutions[[i]])
+}))
+
+target_plot <- ggplot(target_df, aes(x = iteration, y = target_value)) +
+  geom_line(color = "blue") +
+  geom_vline(xintercept = sim_data$temperature_change_points, linetype = "dashed", color = "grey") +
+  labs(x = "Iteracja", y = "Wartość wariancji", title = "Wartości funkcji celu") + 
+  theme_minimal()
+
+
+solution_plot <- ggplot(solutions_df, aes(x = iteration, y = value, group = strata, color = as.factor(strata))) +
+  geom_line() +
+  labs(x = "Iteracja", y = "Rozmiar próbki", color = "Warstwa", title = "Trajektoria dążąca do optymalnej alokacji") + 
+  theme_minimal()
+
+
+
+target_plot
+solution_plot
+
+# Finalne rozwiązanie
+final_solution <- sim_data$solution
+
+# Optymalna wartość z algorytmu RNABox
+optimal_value <- opt(n = n, A = A, m = m, M = M)
+
+# Wariancja
+final_variance <- sim_data$target_values[length(sim_data$target_values)]
+
+# Wydrukowanie wyników
+print("Finalne rozwiązanie:")
+print(final_solution)
+
+# Optymalna wartość z algorytmu RNABox
+print("Optymalna wartość z algorytmu RNABox:")
+print(optimal_value)
+
+# Wariancja
+print("Wariancja:")
+print(final_variance)
+
+```
+
+
+Przykład 2
+```{r, class.source='fold-hide', message=FALSE, warning=FALSE}
+url <- "https://github.com/wwojciech/stratallo/raw/main/data/pop10_mM.rda"
+download.file(url, destfile = "pop10_mM.rda")
+load("pop10_mM.rda")
+
+df <- pop10_mM
+N <- df[, 1]
+S <- df[,2]
+m <- df[,3]
+M <- df[,4]
+n <- 3000
+x <- c(60, 90, 75, 65, 400, 400, 500, 605, 205, 600)
+A <- N * S
+
+T_schedule <- 10:1/100 # Annealing schedule (temperature)
+N_schedule <- (1:length(T_schedule)) * 200 # Annealing schedule (time)
+
+sim_data <- sim_anal_box(x, N, S, m, M, n, T_schedule, N_schedule)
+
+target_df <- data.frame(iteration = 1:length(sim_data$target_values), target_value = sim_data$target_values)
+
+solutions_df <- do.call(rbind, lapply(1:length(sim_data$solutions), function(i) {
+  data.frame(iteration = i, strata = 1:length(sim_data$solutions[[i]]), value = sim_data$solutions[[i]])
+}))
+
+ggplot(target_df, aes(x = iteration, y = target_value)) +
+  geom_line(color = "blue") +
+  geom_vline(xintercept = sim_data$temperature_change_points, linetype = "dashed", color = "grey") +
+  labs(x = "Iteracja", y = "Wartość wariancji", title = "Wykres funkcji celu") + # Dodanie tytułu
+  theme_minimal()
+
+
+ggplot(solutions_df, aes(x = iteration, y = value, group = strata, color = as.factor(strata))) +
+  geom_line() +
+  labs(x = "Iteracja", y = "Rozmiar próbki", color = "Warstwa", title = "Wykres trajektorii wartości dążących do optymalnej alokacji") + # Dodanie tytułu
+  theme_minimal()
+
+# Finalne rozwiązanie
+final_solution <- sim_data$solution
+
+# Optymalna wartość z algorytmu RNABox
+optimal_value <- opt(n = n, A = A, m = m, M = M)
+
+# Wariancja
+final_variance <- sim_data$target_values[length(sim_data$target_values)]
+
+# Wydrukowanie wyników
+print("Finalne rozwiązanie:")
+print(final_solution)
+
+# Optymalna wartość z algorytmu RNABox
+print("Optymalna wartość z algorytmu RNABox:")
+print(optimal_value)
+
+# Wariancja
+print("Wariancja:")
+print(final_variance)
+```
+
+
+Przykład 3
+```{r, class.source='hide', message=FALSE, warning=FALSE}
+set.seed(123) # Ustawienie ziarna losowości dla powtarzalności
+
+N <- sample(2000:10000, 20, replace = TRUE) 
+S <- runif(20, 30, 100) 
+A <- N * S
+m <- sample(10:100, 20, replace = TRUE) 
+M <- m + sample(100:500, 20, replace = TRUE) 
+T_schedule <- 10:1/100 
+N_schedule <- (1:length(T_schedule)) * 200
+x <- m + round(runif(20, 0, 1) * (M - m)) 
+n <- sum(x)
+
+sim_data <- sim_anal_box(x, N, S, m, M, n, T_schedule, N_schedule)
+
+target_df <- data.frame(iteration = 1:length(sim_data$target_values), target_value = sim_data$target_values)
+
+solutions_df <- do.call(rbind, lapply(1:length(sim_data$solutions), function(i) {
+  data.frame(iteration = i, strata = 1:length(sim_data$solutions[[i]]), value = sim_data$solutions[[i]])
+}))
+
+ggplot(target_df, aes(x = iteration, y = target_value)) +
+  geom_line(color = "blue") +
+  geom_vline(xintercept = sim_data$temperature_change_points, linetype = "dashed", color = "grey") +
+  labs(x = "Iteracja", y = "Wartość wariancji", title = "Wykres funkcji celu") + # Dodanie tytułu
+  theme_minimal()
+
+
+ggplot(solutions_df, aes(x = iteration, y = value, group = strata, color = as.factor(strata))) +
+  geom_line() +
+  labs(x = "Iteracja", y = "Rozmiar próbki", color = "Warstwa", title = "Wykres trajektorii wartości dążących do optymalnej alokacji") + # Dodanie tytułu
+  theme_minimal()
+
+# Finalne rozwiązanie
+final_solution <- sim_data$solution
+
+# Optymalna wartość z algorytmu RNABox
+optimal_value <- opt(n = n, A = A, m = m, M = M)
+
+# Wariancja
+final_variance <- sim_data$target_values[length(sim_data$target_values)]
+
+# Wydrukowanie wyników
+print("Finalne rozwiązanie:")
+print(final_solution)
+
+# Optymalna wartość z algorytmu RNABox
+print("Optymalna wartość z algorytmu RNABox:")
+print(optimal_value)
+
+# Wariancja
+print("Wariancja:")
+print(final_variance)
+```
+
+# Próbkowanie dwustopniowe
+
+Po rozgrzewce jaką było próbkowanie jednostopniowe przechodzimy do zdecydowanie bardziej skomplikowanego problemu - próbkowania dwustopniowego z warstwami. Zaznaczmy tu, że tylko jeden 'poziom populacji' w naszym zadaniu będzie podzielony na warstwy. Dokładniej będzie to zawsze 'wyższy' poziom. Przywołując po raz kolejny nasz przykład, chcemy wybrać pewną liczbę uczniów ze szkół, które są przyporządkowane do województw.
+
+## Sformułowanie matematyczne
+
+Wprowadźmy notację potrzebną do sformułowania zadania optymalizacji. Z racji próbkowania dwustopniowego dalej nazywamy próbki z pierwszego stopnia (np. szkoły) jednostkami pierwotnymi (JP), natomiast próbki z drugiego stopnia (np. uczniów) jednostami wtórnymi (JW).
+
+-   $V = W_1 + \ldots + W_H$ - populacja podzielona na warstwy
+-   $\#(W_h) = M_h$ - liczba JP w $h$-tej warstwie ($h = 1, \ldots, H$)
+-   $m_h$ - liczba JP wybranych do próbki z $h$-tej warstwy
+-   $U_{h, j}$ - $j$-ta JP z $h$-tej warstwy
+-   $\#(U_{h, j}) = N_{h, j}$ - liczba JW w $j$-tej JP z $h$-tej warstwy
+-   $n_{h, j}$ - liczba JW wybranych do próbki z $j$-tej JP z $h$-tej warstwy (pod warunkiem wybrania $U_{h, j}$ do próbki)
+-   $N_h = \sum_{j \in W_h} N_{h, j}$
+
+Niech $\hat{t}$ będzie standardowym $\pi$-estymatorem (estymatorem Horvitza-Thompsona, [2]) całkowitej (lub średniej) wartości pewnej cechy $t$. Z [2] wiemy, że jego wariancja dana jest wzorem:
+
+$D^2(\hat{t}) = \sum_{h=1}^H \left( \frac{1}{m_h} - \frac{1}{M_h} \right) M_h^2 D_h^2 + \sum_{h=1}^H \frac{M_h}{m_h} \sum_{j=1}^{M_h} \left( \frac{1}{n_{h,j}} - \frac{1}{N_{h, j}} \right) N_{h, j}^2 S_{h, j}^2$
+
+gdzie:
+
+$t_{h,j} = \sum_{u \in U_{h,j}} y_{h,j,u}, \quad \bar{y}_{h,j} = \frac{t_{h,j}}{N_{h,j}} \quad \text{oraz} \quad \bar{t}_h = \frac{\sum_{j=1}^{M_h} t_{h,j}}{M_h}$
+
+$S^2_{h,j} = \frac{1}{N_{h,j} - 1} \sum_{u \in U_{h,j}} \left( y_{h,j,u} - \bar{y}_{h,j} \right)^2,\quad D^2_h = \frac{1}{M_h - 1} \sum_{j=1}^{M_h} \left( t_{h,j} - \bar{t}_h \right)^2$
+
+Zatem naszym zadaniem jest minimalizacja $D^2(\hat{t})$ jako funkcji $m_h$ i $n_{h, j}$. Ponadto zakładamy, że liczność próbki pierwotnej (czyli liczba JP w próbce) jest ustalona, to znaczy: $\sum_{h=1}^H m_h = m$. Natomiast w celu ustalenia liczności próbki wtórnej (liczby JW w próbce) rozważamy estymator jej oczekiwanej wielkości postaci:
+
+$\sum_{h=1}^H \frac{m_h}{M_h} \sum_{j=1}^{M_h} n_{h, j} = n$
+
+W szczególności widzimy, że $n$ istotnie zależy od wyboru JP. Będzie to miało znaczenie dla implementacji algorytmu symulowanego wyżarzania.
+
+## Rozwiązanie algorytmiczne
+
+Podstawowym pytaniem stawianym nam przez algorytm symulowanego wyżarzania jest sposób określenia 'sąsiedztwa' pomiędzy alokacjami. Nie jest on w tym przypadku tak oczywisty, jak dla próbkowania jednostopniowego. Co więcej, właśnie ta decyzja będzie miała największy wpływ na szybkość i skuteczność jego implementacji. Nasz pomysł prezentuje się następująco:
+
+Określamy sąsiedztwo dla JP i JW w standardowy sposób, analogicznie jak w przypadku próbkowania jednostopniowego. Powracając do przykładu, powiemy, że dwie alokacje na poziomie szkół są sąsiadami jeśli różnią się na dwóch pozycjach o jedną szkołę (przy zachowaniu ich całkowitej liczby). Celowo nie mówimy tu nic o wyborze uczniów dla tych alokacji. Podobnie na poziomie uczniów, powiemy, że dwie alokacje są sąsiadami jeśli różnią się na dwóch pozycjach o jednego ucznia (oczywiście przy ustalonym wyborze szkół a co za tym idzie, przy stałej oczekiwanej liczbie uczniów w próbce). Natomiast zdefiniowanie sąsiedztwa w przypadku, w którym nie ustalamy jednego z poziomów wydaje się mało realne - pojawia się tu wiele problemów, przede wszystkim związanych z ograniczeniami górnymi. Okazuje się jednak, że tak zadane sąsiedztwo jest wystarczające. Poniżej opisujemy schematyczny proces generowania i wyboru kolejnego kroku:
+
+1)  Załóżmy, że mamy pewną alokację - punkt startowy (w praktyce wygenerowany losowo).
+2)  Następnie proponujemy zarówno krok na poziomie JP jak i JW. To znaczy, że generujemy sąsiada na poziomie pierwotnym, przy czym dla tego wyboru JP, JW losujemy niezależnie od tego, w jakiej alokacji aktualnie się znajdujemy. Równolegle generujemy sąsiada na poziomie wtórnym, bez zmiany alokacji poziomu pierwotnego.
+3)  Mamy zatem dwóch kandydatów (w odróżnieniu do klasycznego symulowanego wyżarzania).
+4)  Dalej chcemy na podstawie funkcji celu oraz schematu wyżarzania przejść do jednej z alokacji zaproponowanych w punkcie 2) lub pozostać w miejscu.
+5)  Wykorzystamy tu w istotny sposób funkcję celu, czyli $D^2(\hat{t})$. Niech $D_{JP}$ będzie wartością funkcji celu dla kroku zaproponowanego na poziomie JP. Analogicznie oznaczmy $D_{JW}$. Rozważmy teraz przypadki wynikające z konstrukcji algorytmu symulowanego wyżarzania:
+    a)  Jeśli $D_{JP}$ i $D_{JW}$ oba wskazują na to, że powinniśmy wykonać krok, to wówczas wybieramy propozycję na poziomie JP z prawdopodobieństwem $1-\frac{D_{JP}}{D_{JP}+D_{JW}}$, a z pozostałym prawdopodobieństwem wybieramy propozycję na poziomie JW.
+    b)  Jeśli jedna z wartości $D_{JP}$ lub $D_{JW}$ jednoznacznie wskazuje na to, że powinniśmy wykonać w tę stronę krok, to z prawdopodobieństwem jeden ten krok wykonujemy.
+    c)  Jeśli natomiast obie wartości $D_{JP}$ i $D_{JW}$ niejednoznacznie wskazują czy powinniśmy wykonać krok, to wówczas w zależności od tego, który poziom zaproponował lepszy krok wybieramy ten poziom z prawdopodobieństwem proporcjonalnym do wartości funkcji celu w tym kierunku, a z pozostałym prawdopodobieństwem pozostajemy w miejscu.
+
+Zanim będziemy gotowi uruchomić nasz algorytm potrzebujemy wczytać potrzebne nam funkcje oraz wygenerować przykładową populację dla problemu próbkowania dwustopniowego z warstwami.
+
+::: {style="text-align: center;"}
+<h4>*Funkcja celu, funkcje generujące propozycję*</h4>
+:::
+
+```{r , class.source='fold-hide', echo = TRUE}
+
+set.seed(1337)
+
+inverse_num <- function(x){
+  return(1/x)
+}
+
+# target function - D^2(t_hat)
+
+target <- function(V_sample, M_PSU, strat_var, df_picked_students_number, df, school_var, df_picked_schools){
+    temp1 <- sum((inverse_num(V_sample) - inverse_num(M_PSU)) * M_PSU^2 * strat_var)
+    temp2 <- 0
+    for(i in 1:length(M_PSU)){
+      temp3 <- 0
+      for(j in 1:max(M_PSU)){
+        if(df_picked_schools[i, j] != 0){
+        temp3 <- temp3 + (inverse_num(df_picked_students_number[i, j]) - 
+                            inverse_num(df[i, j]) * df[i, j]^2 * school_var[i, j])
+        }else{temp3 <- temp3}
+      }
+      temp2 <- temp2 + temp3 * M_PSU[i]/V_sample[i]
+    }
+    return(temp1 + temp2)
+}
+
+# proposition generators:
+
+gen_prop_box_stratified_PSU <- function(V_sample, m_PSU, M_PSU){
+  index_move_PSU_1 <- ceiling(runif(1, min=0, max=length(V_sample)))
+  index_move_PSU_2 <- ceiling(runif(1, min=0, max=length(V_sample)))
+  if(index_move_PSU_1 == index_move_PSU_2){
+    return(V_sample)
+  }
+  if(V_sample[index_move_PSU_1] >= m_PSU[index_move_PSU_1] &
+     V_sample[index_move_PSU_1] < M_PSU[index_move_PSU_1] &
+     V_sample[index_move_PSU_2] > m_PSU[index_move_PSU_2] &
+     V_sample[index_move_PSU_2] <= M_PSU[index_move_PSU_2]){
+    
+    V_prop <- V_sample
+    V_prop[index_move_PSU_1] <- V_prop[index_move_PSU_1] + 1
+    V_prop[index_move_PSU_2] <- V_prop[index_move_PSU_2] - 1
+    
+  }else{
+    return(V_sample)
+  }
+  return(V_prop)
+}
+
+gen_prop_box_stratified_SSU <- function(m_school_bound, df, df_picked_students_number, df_picked_schools){
+  index_move_SSU_1 <- ceiling(runif(1, min=0, max=m_school_bound))
+  index_move_SSU_2 <- ceiling(runif(1, min=0, max=m_school_bound))
+  if(index_move_SSU_1 == index_move_SSU_2){
+    return(df_picked_students_number)
+  }
+  indexes_of_picked_PSU <- unname(which(df_picked_schools == 1, arr.ind = T))
+  index_move_SSU_1 <- indexes_of_picked_PSU[index_move_SSU_1,]
+  index_move_SSU_2 <- indexes_of_picked_PSU[index_move_SSU_2,]
+  if(df_picked_students_number[index_move_SSU_1[1], index_move_SSU_1[2]] < 
+     df[index_move_SSU_1[1], index_move_SSU_1[2]] &
+     df_picked_students_number[index_move_SSU_1[1], index_move_SSU_1[2]] >= 0 & 
+     df_picked_students_number[index_move_SSU_2[1], index_move_SSU_2[2]] <=
+     df[index_move_SSU_2[1], index_move_SSU_2[2]] & 
+     df_picked_students_number[index_move_SSU_2[1], index_move_SSU_2[2]] > 1){
+    df_picked_students_number_prop <- df_picked_students_number
+    df_picked_students_number_prop[index_move_SSU_1[1], index_move_SSU_1[2]] <-
+      df_picked_students_number_prop[index_move_SSU_1[1], index_move_SSU_1[2]] + 1
+    df_picked_students_number_prop[index_move_SSU_2[1], index_move_SSU_2[2]] <- 
+      df_picked_students_number_prop[index_move_SSU_2[1], index_move_SSU_2[2]] - 1
+  }else{
+    return(df_picked_students_number)
+  }
+  return(df_picked_students_number_prop)
+}
+
+
+```
+
+Dalej generujemy przykładową populację, która składa się z pięciu warstw:
+
+::: {style="text-align: center;"}
+<h4>*Generator przykładu, obliczamy jego parametry*</h4>
+:::
+
+```{r , class.source='fold-hide', echo = TRUE}
+# Box constrains:
+M_PSU <- c(35, 40, 50, 70, 150) # (V) PSU upper bounds
+m_PSU <- c(1, 1, 1, 1, 1) # PSU lower bounds
+M_SSU <- 50 # Max number of students in a school
+stud_param <- 25 # Max value of a student parameter (e. g. height, used to estimate pop. variance)
+m_school_bound <- 200 # num of schools
+```
+
+```{r , class.source='fold-hide', echo = TRUE}
+# Generate school matrix: 
+
+df <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+for(i in 1:length(M_PSU)){
+  v <- sample.int(M_SSU, M_PSU[i], replace = T) + 1 # (!!!) schools need to have at least 2 students 
+  df[i, 1:M_PSU[i]] <- v
+} # df[i, j] - number of 'students' in j'SSU from i'PSU
+
+# Generate students parameters: (for the sake of D^2 & S^2) 
+
+df_t <- 0
+n <- length(M_PSU) * max(M_PSU)
+df_t <- as.list(numeric(n))
+dim(df_t) <- c(length(M_PSU), max(M_PSU))
+
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    l <- df[i, j]
+    if(l == 0){
+      df_t[[i, j]] <- 0
+    }else{
+      u <- sample.int(stud_param, l, replace = T)
+      df_t[[i, j]] <- u
+    }
+  }
+} # df_t[[i, j]][u] - value of the interest parameter form the u-th student form j-th school from i-th discrict
+
+# school totals: t_(h, j):
+df_t_totals <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    df_t_totals[i, j] <- sum(df_t[[i, j]])
+  }
+}
+
+# stratum average: t_dash:
+strat_avg <- numeric(length(M_PSU))
+for(i in 1:length(M_PSU)){
+  strat_avg[i] <- sum(df_t_totals[i, ])/M_PSU[i]
+}
+
+# school average:
+df_t_school_avg <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    if(length(df_t[[i, j]]) != 0){
+      df_t_school_avg[i, j] <- df_t_totals[i, j] / length(df_t[[i, j]])
+    }else{df_t_school_avg[i, j] <- 0}
+  }
+}
+
+# stratum variance (D^2)_h:
+strat_var <- numeric(length(M_PSU))
+for(i in 1:length(M_PSU)){
+  strat_var[i] <- sum((df_t_totals[i,]-strat_avg[i])^2)/(M_PSU[i]-1)
+}
+
+# school variance (S^2)_(h, j):
+school_var <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    if(length(df_t[[i, j]]) != 1){
+      school_var[i, j] <- sum((df_t[[i, j]]-df_t_school_avg[i, j])^2)/(length(df_t[[i, j]])-1)
+    }else{school_var[i, j] <- 0}
+  }
+}
+```
+
+Potrzebujemy jeszcze startowej akolacji, której użyjemy do uruchomienia algorytmu symulowanego wyżarzania:
+
+::: {style="text-align: center;"}
+<h4>*Generator startowej alokacji*</h4>
+:::
+
+```{r , class.source='fold-hide', echo = TRUE}
+
+# generate school sample with size bounds:
+V_sample <- numeric(length(M_PSU))
+while(sum(V_sample) != m_school_bound){
+  V_sample <- numeric(length(M_PSU))
+  for(i in 1:length(M_PSU)){
+    V_sample[i] <- sample.int(M_PSU[i], 1)
+  }
+  if(any(V_sample < m_PSU)){
+    V_sample <- numeric(length(M_PSU))
+  }
+}
+# pick speficic schools (indexes from df)
+df_picked_schools <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+for(i in 1:length(M_PSU)){
+  s <- sample.int(M_PSU[i], V_sample[i])
+  for(j in 1:length(s)){
+    df_picked_schools[i, s[j]] <- 1
+  }
+}
+
+# generate student sample size (from df with respect to V_sample))
+stud_sample_size <- 0
+for(i in 1:length(M_PSU)){
+  temp <- V_sample[i]/M_PSU[i]
+  stud_sample_size <- stud_sample_size + temp * sum(df[i, ] * df_picked_schools[i, ]) 
+}
+
+# all students:
+stud_all <- sum(df * df_picked_schools)
+
+# generate student sample 
+df_picked_students_number <- df_picked_schools
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    df_picked_students_number[i, j] <- df_picked_students_number[i, j] * 
+      df[i, j] * stud_sample_size / stud_all
+  }
+}
+# generate student matrix (small error):
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    if(df_picked_students_number[i, j] - floor(df_picked_students_number[i, j]) > 0.5){
+      df_picked_students_number[i, j] <- ceiling(df_picked_students_number[i, j])
+    }else{df_picked_students_number[i, j] <- floor(df_picked_students_number[i, j])}
+  }
+}
+```
+
+Powinniśmy napomnieć w tym miejscu, iż decyzja o optymalizacji całkowitoliczbowej kosztuje nas w tym miejscu delikatą utratę precyzji. Dokładniej, przełożenie estymowanej wielkości próbki na poziomie wtórnym wymaga, dla dalszego działania algorytmu, zaokrąglania wartości JW do liczb całkowitych. Empirycznie sprawdziliśmy, że ta strata jest na zaniedbywalnym poziomie. Wrócimy jeszcze do niej przy okazji podsumowania tego rozdziału.
+
+Mając już wygenerowaną populację i punkt startowy pozostaje wyłącznie postawienie schematu wyżarzania. Znalezienie jednak, w ogólności, schematu optymalnego wydaje się zgoła niemożliwe. Z pomocą licznych prób doszliśmy do schematu, który najczęściej dawał zadowalające wyniki, przy czym czasami istotnie zależały one od wygenerowanego punktu początkowego. Chcielibyśmy podsumować ten wybór stwierdzeniem, iż dla danej populacji znalezienie schematu optymalnego wydaje się być głównie kwestią czasu, czyli kwestią prób i błędów. Poniżej prezentujemy nasz wybór:
+
+::: {style="text-align: center;"}
+<h4>*Schemat wyżarzania*</h4>
+:::
+
+```{r , class.source='fold-hide', echo = TRUE}
+eps <- 1e-10 #for the sake of numeric stability (avoiding zero-division)
+T_schedule <- 1:20*100000 # Annealing schedule (temperature) 
+N_schedule <- numeric(length(T_schedule)) + 20 # Annealing schedule (time)
+N_schedule[1] <- N_schedule[1] + 500
+N_schedule[2] <- N_schedule[2] + 300
+N_schedule[3] <- N_schedule[3] + 200
+N_schedule[4] <- N_schedule[4] + 100
+```
+
+::: {style="text-align: center;"}
+<h4>*Implementacja*</h4>
+:::
+
+```{r , class.source='fold-hide', echo = TRUE}
+# For plotting and assessments
+temp_target_PSU_change <- list()
+temp_target_SSU_change <- list()
+temp_step_PSU <- list()
+temp_step_SSU <- list()
+
+# THE annealing:
+
+for(i in 1:length(N_schedule)){
+  T_temp <- T_schedule[i]
+  for(j in 1:N_schedule[i]){
+    V_prop <- gen_prop_box_stratified_PSU(V_sample, m_PSU, M_PSU)
+    df_picked_schools_V_prop <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+    for(i in 1:length(M_PSU)){
+      s <- sample.int(M_PSU[i], V_prop[i])
+      for(j in 1:length(s)){
+        df_picked_schools_V_prop[i, s[j]] <- 1
+      }
+    }
+    stud_sample_size_V_prop <- 0
+    for(i in 1:length(M_PSU)){
+      temp <- V_prop[i]/M_PSU[i]
+      stud_sample_size_V_prop <- stud_sample_size_V_prop + temp * sum(df[i, ] * df_picked_schools_V_prop[i, ]) 
+    }
+    stud_all_V_prop <- sum(df * df_picked_schools_V_prop)
+    df_picked_students_number_V_prop <- df_picked_schools_V_prop
+    for(i in 1:length(M_PSU)){
+      for(j in 1:max(M_PSU)){
+        df_picked_students_number_V_prop[i, j] <- df_picked_students_number_V_prop[i, j] * 
+          df[i, j] * stud_sample_size_V_prop / stud_all_V_prop
+      }
+    }
+    for(i in 1:length(M_PSU)){
+      for(j in 1:max(M_PSU)){
+        if(df_picked_students_number_V_prop[i, j] - floor(df_picked_students_number_V_prop[i, j]) > 0.5){
+          df_picked_students_number_V_prop[i, j] <- ceiling(df_picked_students_number_V_prop[i, j])
+        }else{df_picked_students_number_V_prop[i, j] <- floor(df_picked_students_number_V_prop[i, j])}
+      }
+    }
+    df_picked_students_number_prop <- gen_prop_box_stratified_SSU(m_school_bound, df, 
+                                                                  df_picked_students_number, 
+                                                                  df_picked_schools)
+    transit_value_PSU <- exp((target(V_sample, M_PSU, strat_var, 
+                                     df_picked_students_number, 
+                                     df, school_var, df_picked_schools)-
+                                target(V_prop, M_PSU, strat_var, 
+                                       df_picked_students_number_V_prop, 
+                                       df, school_var, df_picked_schools_V_prop))/T_temp)
+    transit_value_SSU <- exp((target(V_sample, M_PSU, strat_var, 
+                                     df_picked_students_number, 
+                                     df, school_var, df_picked_schools)-
+                                target(V_sample, M_PSU, strat_var, 
+                                       df_picked_students_number_prop, 
+                                       df, school_var, df_picked_schools))/T_temp)
+    temp_target_PSU_change <- append(temp_target_PSU_change, target(V_sample, M_PSU, strat_var,
+                                                                    df_picked_students_number,
+                                                                    df, school_var, df_picked_schools))
+    temp_target_SSU_change <- append(temp_target_SSU_change, target(V_sample, M_PSU, strat_var,
+                                                                    df_picked_students_number,
+                                                                    df, school_var, df_picked_schools))
+    prob_move_PSU <- min(1, transit_value_PSU)
+    prob_move_SSU <- min(1, transit_value_SSU)
+    mass <- target(V_prop, M_PSU, strat_var, 
+                   df_picked_students_number_V_prop, 
+                   df, school_var, df_picked_schools_V_prop) + 
+      target(V_sample, M_PSU, strat_var, 
+             df_picked_students_number_prop, 
+             df, school_var, df_picked_schools)
+    #print(V_sample)
+    if(prob_move_PSU == 1 & prob_move_SSU == 1){
+      coin_flip <- runif(1)
+      if(target(V_prop, M_PSU, strat_var, 
+                df_picked_students_number_V_prop, 
+                df, school_var, df_picked_schools_V_prop)/mass > coin_flip){
+        V_sample <- V_prop
+        temp_step_PSU <- append(temp_step_PSU, length(which(unlist(temp_step_PSU) > 0)) + 1)
+        temp_step_SSU <- append(temp_step_SSU, 0)
+      }else{
+        df_picked_students_number <- df_picked_students_number_prop
+        temp_step_SSU <- append(temp_step_SSU, length(which(unlist(temp_step_SSU) > 0)) + 1)
+        temp_step_PSU <- append(temp_step_PSU, 0)
+      }
+    }
+    if(prob_move_PSU == 1 & prob_move_SSU < 1){
+      V_sample <- V_prop
+      temp_step_PSU <- append(temp_step_PSU, length(which(unlist(temp_step_PSU) > 0)) + 1)
+      temp_step_SSU <- append(temp_step_SSU, 0)
+    }
+    if(prob_move_PSU < 1 & prob_move_SSU == 1){
+      df_picked_students_number <- df_picked_students_number_prop
+      temp_step_SSU <- append(temp_step_SSU, length(which(unlist(temp_step_SSU) > 0)) + 1)
+      temp_step_PSU <- append(temp_step_PSU, 0)
+    }
+    if(prob_move_PSU < 1 & prob_move_SSU < 1){
+      if(prob_move_PSU < eps & prob_move_SSU < eps){
+        V_sample <- V_sample
+        df_picked_students_number <- df_picked_students_number
+        temp_step_SSU <- append(temp_step_SSU, -50)
+        temp_step_PSU <- append(temp_step_PSU, -50)
+      }
+      if(prob_move_PSU > prob_move_SSU){
+        coin_flip <- runif(1)
+        if(coin_flip < prob_move_PSU){
+          V_sample <- V_prop
+          temp_step_PSU <- append(temp_step_PSU, length(which(unlist(temp_step_PSU) > 0)) + 1)
+          temp_step_SSU <- append(temp_step_SSU, 0)
+        }else{
+          V_sample <- V_sample
+          df_picked_students_number <- df_picked_students_number
+          temp_step_SSU <- append(temp_step_SSU, -50)
+          temp_step_PSU <- append(temp_step_PSU, -50)
+        }
+      }
+      if(prob_move_SSU > prob_move_PSU){
+        coin_flip <- runif(1)
+        if(coin_flip < prob_move_SSU){
+          df_picked_students_number <- df_picked_students_number_prop
+          temp_step_SSU <- append(temp_step_SSU, length(which(unlist(temp_step_SSU) > 0)) + 1)
+          temp_step_PSU <- append(temp_step_PSU, 0)
+        }else{
+          V_sample <- V_sample
+          df_picked_students_number <- df_picked_students_number
+          temp_step_SSU <- append(temp_step_SSU, -50)
+          temp_step_PSU <- append(temp_step_PSU, -50)
+        }
+      }
+      if(prob_move_PSU == prob_move_SSU){
+        V_sample <- V_sample
+        df_picked_students_number <- df_picked_students_number
+        temp_step_SSU <- append(temp_step_SSU, -50)
+        temp_step_PSU <- append(temp_step_PSU, -50)
+      }
+    }
+  }
+}
+```
+
+```{r echo=FALSE}
+# Uzyskana alokacja na poziome JP
+cat("Uzyskana alokacja:")
+cat(V_sample)
+
+plot(unlist(temp_target_PSU_change),type = "l", pch = 23, col = "black", lty = 1, 
+     xlab = "Liczba wygenerowanych kroków", 
+     ylab = "Wartość funkcji celu")
+```
+
+## Porównania
+
+Pomimo tego, iż na podstawie powyższego wykresu moglibyśmy wnioskować, że nasz algorytm faktycznie zbiegł do (jakiegoś) rozwiązania, to chcielibyśmy móc je z czymś porównać. Oczywiście dobrą praktyką byłoby wykonanie symulowanego wyżarzania wielokrotnie w celu uzyskania statystycznego oglądu na sytuację. My jednak zestawimy otrzymany wynik z teoretycznym, uzyskanym w pracy [2]. Co warto pamiętać, w tej pracy dowód optymalności alkoacji został przeprowadzony w przypadku bez (naturalnych) ograniczeń górnych. Niemniej my optymalizujemy po istotnie mniejszym zbiorze, więc jeżeli nasz wynik będzie stostunkowo zbliżony do teoretycznego, to będzie to świadczyło, że jest on 'całkiem dobry'. W celu tego porównania zaprezentujemy formalnie optymalną alokację występującą w [2] (czyli bez ograniczeń górnych), wyliczymy ją na podstawie wygenerowanej wcześniej populacji i zestawimy z alokacją otrzymaną poprzez algorytm symulowanego wyżarzania.
+
+Pod warunkiem $\gamma_h = M_h D^2_h - \sum_{j=1}^{M_h} N_{h,j} S^2_{h,j} > 0$ optymalna alokacja przyjmuje postać:
+
+$m_h = \frac{\sqrt{M_h \gamma_h}}{\sum_{k=1}^H \sqrt{M_k \gamma_k}}m$
+
+$n_{h, j} = n \frac{M_h}{m_h} \cdot \frac{N_{h, j} S_{h, j}}{\sum_{k=1}^H \sum_{l=1}^{M_k} N_{k,l} S_{k,l}}$
+
+Natomiast minimalna wariancja wyraża się wzorem:
+
+$D_{opt}^2(\hat{t}) = \frac{1}{m} \left( \sum_{h=1}^H \sqrt{M_h \gamma_h} \right)^2 + \frac{1}{n} \left( \sum_{h=1}^H \sum_{j=1}^{M_h} N_{h, j} S_{h, j} \right)^2 - \sum_{h=1}^H M_h D_h^2$
+
+::: {style="text-align: center;"}
+<h4>*Porównania*</h4>
+:::
+
+```{r , class.source='fold-hide', echo = TRUE}
+gamma <- M_PSU * strat_var
+for(i in 1:length(gamma)){
+  gamma[i] <- gamma[i] - sum(df[i,]*school_var[i,])
+}
+# optimal alloc:
+opt_PSU <- m_school_bound * sqrt(M_PSU * gamma)/sum(sqrt(M_PSU * gamma))
+opt_SSU <- matrix(0, nrow = length(M_PSU), ncol = max(M_PSU))
+temp <- 0
+for(i in 1:length(M_PSU)){
+  temp <- temp + sum(df[i, ] * sqrt(school_var[i, ]))
+}
+for(i in 1:length(M_PSU)){
+  for(j in 1:max(M_PSU)){
+    opt_SSU[i, j] <- stud_sample_size * (M_PSU[i]/opt_PSU[i]) * df[i, j] * sqrt(school_var[i, j])/temp 
+  }
+}
+# optimal variance:
+opt_var <- sum(sqrt(M_PSU * gamma))^2/m_school_bound + (temp)^2/stud_sample_size - sum(M_PSU * strat_var)
+cat("Optymalna alokacja na poziomie JP:", opt_PSU)
+cat("Uzyskana alokacja na poziome JP:", V_sample)
+cat("Optymalna wariancja:", opt_var)
+cat("Uzyskana wariancja:", unlist(temp_target_PSU_change)[length(unlist(temp_target_PSU_change))])
+cat("Błąd względny: ", abs(unlist(temp_target_PSU_change)[length(unlist(temp_target_PSU_change))]-opt_var)/opt_var)
+```
+
+# Podsumowanie
+
+W tej pracy skupiliśmy się na opisaniu dwóch modeli próbkowania warstwowego oraz zastosowaliśmy do obu zagadnień algorytm symulowanego wyżarzania w celu znalezienia optymalnej alokacji. Pomimo licznych (nawet bardzo licznych) potknięć, szczególnie w części drugiej, udało nam się uzyskać względnie zadowalające wyniki - zarówno pod względem jakości jak i efektywności rozwiązań. Niemniej rozważane problemy dalej pozostawiają wiele pracy. Teoria próbkowania okazała się (dość zaskakująco) być niezwykle bogata, zarówno pod względem głębokości i szerokości podejmowanych aspektów matematycznych jak i wymagań informatycznych, oraz wyjątkowo satysfakcjonująca do 'pogłówkowania nad'. Jesteśmy przekonani, że nasze rozwiązanie algorytmiczne problemu drugiego można na wielu płaszczyznach istotnie ulepszyć. Wartym uwagi wydają się nie tylko potencjalnie inne modyfikacje samej części 'wyżarzającej' czy jej parametry, ale również podpierająca je konstrukcja 'danych'.  
+
+Podczas tego typu projektów kluczowym wydaje się być odpowiednie podejście do zadania. Aby ciężka praca była faktycznie satysfakcjonująca trzeba zbudować z rozważanym problemem pewną emocjonalną więź - inaczej są to tylko litery i cyfry, które na koniec nie mają większego znaczenia. Życzymy sobie oraz czytelnikowi właśnie tego w kolejnych wyzwaniach. 
+
+Dziękujemy za uwagę!
+
+
+
+
+
+
+
+
+
+
